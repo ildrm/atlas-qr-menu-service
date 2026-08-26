@@ -1,0 +1,86 @@
+import "reflect-metadata";
+
+import type { IncomingMessage } from "node:http";
+
+import cookie from "@fastify/cookie";
+import helmet from "@fastify/helmet";
+import rateLimit from "@fastify/rate-limit";
+import { NestFactory } from "@nestjs/core";
+import {
+  FastifyAdapter,
+  type NestFastifyApplication,
+} from "@nestjs/platform-fastify";
+import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
+
+import { AppModule } from "./app.module.js";
+import { appConfig } from "./config.js";
+
+const adapter = new FastifyAdapter({
+  logger: {
+    level: appConfig.NODE_ENV === "production" ? "info" : "warn",
+    redact: [
+      "req.headers.authorization",
+      "req.headers.cookie",
+      "res.headers.set-cookie",
+      "password",
+      "token",
+    ],
+  },
+  bodyLimit: 1_048_576,
+  trustProxy: appConfig.NODE_ENV === "production",
+  genReqId: (request: IncomingMessage) =>
+    String(request.headers["x-request-id"] ?? crypto.randomUUID()),
+});
+
+const app = await NestFactory.create<NestFastifyApplication>(
+  AppModule,
+  adapter,
+  { bufferLogs: true },
+);
+await app.register(cookie);
+await app.register(helmet, {
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'none'"],
+      frameAncestors: ["'none'"],
+      baseUri: ["'none'"],
+      formAction: ["'self'"],
+    },
+  },
+  frameguard: { action: "deny" },
+  hsts:
+    appConfig.NODE_ENV === "production"
+      ? { maxAge: 31_536_000, includeSubDomains: true, preload: true }
+      : false,
+  crossOriginResourcePolicy: { policy: "cross-origin" },
+});
+await app.register(rateLimit, {
+  max: 180,
+  timeWindow: "1 minute",
+  allowList: appConfig.NODE_ENV === "test" ? ["127.0.0.1"] : [],
+});
+
+app.enableCors({
+  origin: appConfig.WEB_ORIGIN,
+  credentials: true,
+  methods: ["GET", "HEAD", "POST", "PATCH", "PUT", "DELETE", "OPTIONS"],
+});
+app.enableShutdownHooks();
+
+if (appConfig.NODE_ENV !== "production") {
+  const openApiConfig = new DocumentBuilder()
+    .setTitle("AtlasQR API")
+    .setDescription(
+      "Tenant-safe API for businesses, catalogs, public experiences, and dynamic QR resolution.",
+    )
+    .setVersion("1.0")
+    .addCookieAuth(appConfig.SESSION_COOKIE_NAME)
+    .build();
+  SwaggerModule.setup(
+    "api/docs",
+    app,
+    SwaggerModule.createDocument(app, openApiConfig),
+  );
+}
+
+await app.listen(appConfig.API_PORT, "0.0.0.0");

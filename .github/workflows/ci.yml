@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_DB: atlasqr_test
+          POSTGRES_USER: atlas
+          POSTGRES_PASSWORD: atlas_test
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U atlas -d atlasqr_test"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+      redis:
+        image: redis:8-alpine
+        ports: ["6379:6379"]
+    env:
+      DATABASE_URL: postgresql://atlas:atlas_test@localhost:5432/atlasqr_test
+      REDIS_URL: redis://localhost:6379
+      SESSION_PEPPER: ci-only-session-pepper-with-32-characters
+      CSRF_SECRET: ci-only-csrf-secret-with-32-characters
+      NEXT_PUBLIC_API_URL: http://localhost:4000/api/v1
+      WEB_ORIGIN: http://localhost:3000
+      PUBLIC_WEB_BASE_URL: http://localhost:3000
+      PUBLIC_QR_BASE_URL: http://localhost:4000/q
+      PLAYWRIGHT_BASE_URL: http://localhost:3000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.28.2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm db:migrate
+      - run: pnpm format:check
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+      - run: pnpm build
+      - run: pnpm db:seed
+      - run: pnpm exec playwright install --with-deps chromium
+      - name: Browser acceptance
+        run: |
+          pnpm --filter @atlas/api start > /tmp/atlas-api.log 2>&1 &
+          pnpm --filter @atlas/worker start > /tmp/atlas-worker.log 2>&1 &
+          pnpm --filter @atlas/web start > /tmp/atlas-web.log 2>&1 &
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:4000/health/ready >/dev/null && curl --fail --silent http://localhost:3000/login >/dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          curl --fail http://localhost:4000/health/ready
+          curl --fail http://localhost:3000/login
+          pnpm test:e2e

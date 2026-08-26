@@ -1,0 +1,30 @@
+{
+  "name": "atlasqr",
+  "version": "0.1.0",
+  "private": true,
+  "packageManager": "pnpm@10.28.2",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "build": "turbo run build",
+    "dev": "turbo run dev --parallel",
+    "lint": "turbo run lint",
+    "typecheck": "pnpm --filter @atlas/contracts build && pnpm --filter @atlas/database build && turbo run typecheck",
+    "test": "turbo run test",
+    "test:e2e": "pnpm --filter @atlas/web test:e2e",
+    "format:check": "prettier --check .",
+    "format": "prettier --write .",
+    "db:generate": "pnpm --filter @atlas/database generate",
+    "db:migrate": "pnpm --filter @atlas/database migrate",
+    "db:seed": "pnpm --filter @atlas/database seed",
+    "db:studio": "pnpm --filter @atlas/database studio"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.13",
+    "prettier": "^3.8.2",
+    "turbo": "^2.7.11",
+    "typescript": "^6.0.2",
+    "vitest": "^4.1.11"
+  }
+}
