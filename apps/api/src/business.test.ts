@@ -1,7 +1,7 @@
 import { HttpException, HttpStatus } from "@nestjs/common";
 import { describe, expect, it } from "vitest";
 
-import { assertPlanLimit } from "./business.js";
+import { assertPlanLimit } from "./entitlements.js";
 
 function expectHttpException(run: () => void, status: number, code: string) {
   try {
