@@ -1,7 +1,8 @@
-import { createHmac, randomBytes } from "node:crypto";
+import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
 
 import {
   Body,
+  ConflictException,
   Controller,
   Get,
   Injectable,
@@ -68,9 +69,7 @@ export class AuthService {
         locale: users.locale,
       });
     if (!user)
-      throw new UnauthorizedException(
-        "An account with that email already exists",
-      );
+      throw new ConflictException("An account with that email already exists");
     return user;
   }
 
@@ -155,7 +154,13 @@ export class AuthService {
       .from(sessions)
       .where(eq(sessions.id, sessionId))
       .limit(1);
-    return session?.csrfHash === csrfHash(rawToken);
+    if (!session?.csrfHash) return false;
+    const expected = Buffer.from(session.csrfHash, "hex");
+    const candidate = Buffer.from(csrfHash(rawToken), "hex");
+    return (
+      expected.length === candidate.length &&
+      timingSafeEqual(expected, candidate)
+    );
   }
 
   async revoke(sessionId: string) {
@@ -209,6 +214,9 @@ export class AuthController {
     });
     response.setCookie(CSRF_COOKIE, result.csrf, {
       path: "/",
+      ...(appConfig.CSRF_COOKIE_DOMAIN
+        ? { domain: appConfig.CSRF_COOKIE_DOMAIN }
+        : {}),
       httpOnly: false,
       secure,
       sameSite: "lax",
@@ -237,7 +245,12 @@ export class AuthController {
   ) {
     await this.auth.revoke(context.sessionId);
     response.clearCookie(appConfig.SESSION_COOKIE_NAME, { path: "/" });
-    response.clearCookie(CSRF_COOKIE, { path: "/" });
+    response.clearCookie(CSRF_COOKIE, {
+      path: "/",
+      ...(appConfig.CSRF_COOKIE_DOMAIN
+        ? { domain: appConfig.CSRF_COOKIE_DOMAIN }
+        : {}),
+    });
     return { data: { loggedOut: true }, requestId: String(request.id) };
   }
 }

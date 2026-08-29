@@ -3,8 +3,8 @@ node_modules
 dist
 coverage
 .turbo
-.env
-.env.local
+.env*
+!.env.example
 *.log
 .DS_Store
 playwright-report

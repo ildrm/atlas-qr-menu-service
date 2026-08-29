@@ -6,18 +6,22 @@
       "outputs": [".next/**", "!.next/cache/**", "dist/**"]
     },
     "dev": {
+      "dependsOn": ["^build"],
       "cache": false,
       "persistent": true
     },
     "lint": {
-      "dependsOn": ["^lint"]
+      "dependsOn": ["^build", "^lint"]
     },
     "typecheck": {
-      "dependsOn": ["^typecheck"]
+      "dependsOn": ["^build", "^typecheck"]
     },
     "test": {
+      "dependsOn": ["^build"]
+    },
+    "seed": {
       "dependsOn": ["^build"],
-      "outputs": ["coverage/**"]
+      "cache": false
     }
   }
 }

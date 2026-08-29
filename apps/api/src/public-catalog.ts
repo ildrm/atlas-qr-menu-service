@@ -1,8 +1,17 @@
-import { Controller, Get, Injectable, Param, Query, Req } from "@nestjs/common";
+import {
+  Controller,
+  Get,
+  Injectable,
+  NotFoundException,
+  Param,
+  Query,
+  Req,
+} from "@nestjs/common";
 import {
   branchItemOverrides,
   branches,
   businesses,
+  catalogBranches,
   catalogs,
   categories,
   categoryTranslations,
@@ -12,7 +21,7 @@ import {
   variants,
 } from "@atlas/database";
 import type { PublicCatalog } from "@atlas/contracts";
-import { and, eq, ilike, inArray, or, sql } from "drizzle-orm";
+import { and, eq, gt, ilike, inArray, isNull, lte, or, sql } from "drizzle-orm";
 
 import { Public, type AuthenticatedRequest } from "./common.js";
 import { DatabaseService } from "./database.service.js";
@@ -33,6 +42,7 @@ export class PublicCatalogService {
     catalogSlug: string,
     query: PublicCatalogQuery,
   ): Promise<PublicCatalog | null> {
+    const now = new Date();
     const [base] = await this.database.db
       .select({
         businessId: businesses.id,
@@ -58,7 +68,10 @@ export class PublicCatalogService {
           eq(businesses.slug, businessSlug),
           eq(catalogs.slug, catalogSlug),
           eq(businesses.public, true),
+          isNull(businesses.suspendedAt),
           eq(catalogs.status, "published"),
+          or(isNull(catalogs.startsAt), lte(catalogs.startsAt, now)),
+          or(isNull(catalogs.endsAt), gt(catalogs.endsAt, now)),
         ),
       )
       .limit(1);
@@ -77,6 +90,13 @@ export class PublicCatalogService {
             openingHours: branches.openingHours,
           })
           .from(branches)
+          .innerJoin(
+            catalogBranches,
+            and(
+              eq(catalogBranches.branchId, branches.id),
+              eq(catalogBranches.catalogId, base.catalogId),
+            ),
+          )
           .where(
             and(
               eq(branches.businessId, base.businessId),
@@ -86,6 +106,7 @@ export class PublicCatalogService {
           )
           .limit(1)
       : [null];
+    if (query.branch && !branch) return null;
 
     const categoryRows = await this.database.db
       .select({
@@ -157,6 +178,15 @@ export class PublicCatalogService {
         popular: items.popular,
       })
       .from(items)
+      .innerJoin(
+        categories,
+        and(
+          eq(categories.id, items.categoryId),
+          eq(categories.businessId, base.businessId),
+          eq(categories.catalogId, base.catalogId),
+          eq(categories.visible, true),
+        ),
+      )
       .leftJoin(
         itemTranslations,
         and(
@@ -170,6 +200,7 @@ export class PublicCatalogService {
           ? and(
               eq(branchItemOverrides.itemId, items.id),
               eq(branchItemOverrides.branchId, branch.id),
+              eq(branchItemOverrides.businessId, base.businessId),
             )
           : sql`false`,
       )
@@ -267,8 +298,10 @@ export class PublicCatalogController {
     @Query() query: PublicCatalogQuery,
     @Req() request: AuthenticatedRequest,
   ) {
+    const data = await this.publicCatalog.get(businessSlug, catalogSlug, query);
+    if (!data) throw new NotFoundException("Published catalog not found");
     return {
-      data: await this.publicCatalog.get(businessSlug, catalogSlug, query),
+      data,
       requestId: String(request.id),
     };
   }

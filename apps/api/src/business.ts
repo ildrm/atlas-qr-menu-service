@@ -2,6 +2,8 @@ import {
   Body,
   Controller,
   Get,
+  HttpException,
+  HttpStatus,
   Injectable,
   Patch,
   Post,
@@ -30,6 +32,7 @@ import {
   allPermissions,
   createBusinessSchema,
   createBranchSchema,
+  type Permission,
   updateThemeSchema,
 } from "@atlas/contracts";
 import { and, count, desc, eq, gte, sql } from "drizzle-orm";
@@ -43,6 +46,80 @@ import {
   type RequestAuthContext,
 } from "./common.js";
 import { DatabaseService } from "./database.service.js";
+
+const ACTIVE_SUBSCRIPTION_STATUSES = ["trialing", "active", "grace"] as const;
+
+type PlanLimitConfiguration = {
+  status: string;
+  planActive: boolean;
+  value: boolean | number | string | null;
+};
+
+function throwEntitlementConfigurationError(
+  entitlementKey: string,
+  message = `The ${entitlementKey} entitlement is not configured.`,
+): never {
+  throw new HttpException(
+    {
+      code: "ENTITLEMENT_CONFIGURATION_ERROR",
+      message,
+      details: { entitlementKey },
+    },
+    HttpStatus.SERVICE_UNAVAILABLE,
+  );
+}
+
+export function assertPlanLimit(
+  configuration: PlanLimitConfiguration | undefined,
+  entitlementKey: string,
+  currentUsage: number,
+) {
+  if (
+    !configuration ||
+    !configuration.planActive ||
+    !ACTIVE_SUBSCRIPTION_STATUSES.includes(
+      configuration.status as (typeof ACTIVE_SUBSCRIPTION_STATUSES)[number],
+    )
+  ) {
+    throw new HttpException(
+      {
+        code: "SUBSCRIPTION_INACTIVE",
+        message: "An active subscription is required for this operation.",
+        details: {
+          entitlementKey,
+          subscriptionStatus: configuration?.status ?? "missing",
+        },
+      },
+      HttpStatus.PAYMENT_REQUIRED,
+    );
+  }
+
+  if (configuration.value === "unlimited") return;
+  if (
+    typeof configuration.value !== "number" ||
+    !Number.isSafeInteger(configuration.value) ||
+    configuration.value < 0
+  ) {
+    throwEntitlementConfigurationError(entitlementKey);
+  }
+  if (currentUsage >= configuration.value)
+    throwLimitReached(entitlementKey, currentUsage, configuration.value);
+}
+
+function throwLimitReached(
+  entitlementKey: string,
+  currentUsage: number,
+  limit: number,
+): never {
+  throw new HttpException(
+    {
+      code: "LIMIT_REACHED",
+      message: `The ${entitlementKey} plan limit has been reached.`,
+      details: { entitlementKey, currentUsage, limit },
+    },
+    HttpStatus.CONFLICT,
+  );
+}
 
 @Injectable()
 export class BusinessService {
@@ -135,12 +212,16 @@ export class BusinessService {
         .from(plans)
         .where(eq(plans.code, "free"))
         .limit(1);
-      if (freePlan)
-        await transaction.insert(subscriptions).values({
-          businessId: business.id,
-          planId: freePlan.id,
-          status: "active",
-        });
+      if (!freePlan)
+        throwEntitlementConfigurationError(
+          "plan.free",
+          "The default plan is not configured.",
+        );
+      await transaction.insert(subscriptions).values({
+        businessId: business.id,
+        planId: freePlan.id,
+        status: "active",
+      });
       await transaction.insert(themes).values({
         businessId: business.id,
         name: "Atlas Editorial",
@@ -175,12 +256,37 @@ export class BusinessService {
   ) {
     const input = parseBody(createBranchSchema, body);
     return this.database.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${`${businessId}:max.branches`}))`,
+      );
       const [business] = await transaction
         .select({ id: businesses.id })
         .from(businesses)
         .where(eq(businesses.id, businessId))
         .limit(1);
       if (!business) throw new Error("Business not found");
+      const [usage] = await transaction
+        .select({ value: count() })
+        .from(branches)
+        .where(eq(branches.businessId, businessId));
+      const [entitlement] = await transaction
+        .select({
+          status: subscriptions.status,
+          planActive: plans.active,
+          value: planEntitlements.value,
+        })
+        .from(subscriptions)
+        .innerJoin(plans, eq(plans.id, subscriptions.planId))
+        .leftJoin(
+          planEntitlements,
+          and(
+            eq(planEntitlements.planId, subscriptions.planId),
+            eq(planEntitlements.key, "max.branches"),
+          ),
+        )
+        .where(eq(subscriptions.businessId, businessId))
+        .limit(1);
+      assertPlanLimit(entitlement, "max.branches", usage?.value ?? 0);
       const [branch] = await transaction
         .insert(branches)
         .values({
@@ -270,7 +376,8 @@ export class BusinessService {
         .select()
         .from(themes)
         .where(and(eq(themes.businessId, businessId), eq(themes.active, true)))
-        .limit(1);
+        .limit(1)
+        .for("update");
       const tokens = { ...(current?.tokens ?? {}), ...input };
       const [theme] = current
         ? await transaction
@@ -307,8 +414,10 @@ export class BusinessService {
     });
   }
 
-  async dashboard(businessId: string) {
+  async dashboard(businessId: string, permissions: readonly Permission[] = []) {
     const since = new Date(Date.now() - 7 * 86_400_000);
+    const canViewAnalytics = permissions.includes("analytics.view");
+    const canReadQr = permissions.includes("qr.read");
     const [business] = await this.database.db
       .select({
         id: businesses.id,
@@ -322,32 +431,40 @@ export class BusinessService {
       .limit(1);
     if (!business) return null;
 
-    const [metric] = await this.database.db
-      .select({
-        catalogViews: sql<number>`count(*) filter (where ${analyticsEvents.eventName} = 'catalog_viewed')::int`,
-        itemOpens: sql<number>`count(*) filter (where ${analyticsEvents.eventName} = 'item_viewed')::int`,
-        shares: sql<number>`count(*) filter (where ${analyticsEvents.eventName} = 'item_shared')::int`,
-      })
-      .from(analyticsEvents)
-      .where(
-        and(
-          eq(analyticsEvents.businessId, businessId),
-          gte(analyticsEvents.occurredAt, since),
-        ),
-      );
-    const [scanMetric] = await this.database.db
-      .select({ scans: count() })
-      .from(qrScans)
-      .where(
-        and(eq(qrScans.businessId, businessId), gte(qrScans.occurredAt, since)),
-      );
+    const [metric] = canViewAnalytics
+      ? await this.database.db
+          .select({
+            catalogViews: sql<number>`count(*) filter (where ${analyticsEvents.eventName} = 'catalog_viewed')::int`,
+            itemOpens: sql<number>`count(*) filter (where ${analyticsEvents.eventName} = 'item_viewed')::int`,
+            shares: sql<number>`count(*) filter (where ${analyticsEvents.eventName} = 'item_shared')::int`,
+          })
+          .from(analyticsEvents)
+          .where(
+            and(
+              eq(analyticsEvents.businessId, businessId),
+              gte(analyticsEvents.occurredAt, since),
+            ),
+          )
+      : [];
+    const [scanMetric] = canViewAnalytics
+      ? await this.database.db
+          .select({ scans: count() })
+          .from(qrScans)
+          .where(
+            and(
+              eq(qrScans.businessId, businessId),
+              gte(qrScans.occurredAt, since),
+            ),
+          )
+      : [];
 
-    const activityRows = await this.database.pool.query<{
-      day: string;
-      catalog_views: number;
-      qr_scans: number;
-    }>(
-      `with days as (
+    const activityRows = canViewAnalytics
+      ? await this.database.pool.query<{
+          day: string;
+          catalog_views: number;
+          qr_scans: number;
+        }>(
+          `with days as (
          select generate_series(current_date - interval '6 days', current_date, interval '1 day')::date as day
        ), views as (
          select occurred_at::date as day, count(*)::int as value
@@ -362,29 +479,32 @@ export class BusinessService {
        )
        select days.day::text, coalesce(views.value, 0)::int as catalog_views, coalesce(scans.value, 0)::int as qr_scans
        from days left join views using (day) left join scans using (day) order by days.day`,
-      [businessId],
-    );
+          [businessId],
+        )
+      : { rows: [] };
 
-    const popularRows = await this.database.db
-      .select({
-        id: items.id,
-        name: items.name,
-        imageUrl: items.primaryImageUrl,
-        opens: count(analyticsEvents.id),
-      })
-      .from(items)
-      .leftJoin(
-        analyticsEvents,
-        and(
-          eq(analyticsEvents.itemId, items.id),
-          eq(analyticsEvents.eventName, "item_viewed"),
-          gte(analyticsEvents.occurredAt, since),
-        ),
-      )
-      .where(eq(items.businessId, businessId))
-      .groupBy(items.id)
-      .orderBy(desc(count(analyticsEvents.id)), items.name)
-      .limit(3);
+    const popularRows = canViewAnalytics
+      ? await this.database.db
+          .select({
+            id: items.id,
+            name: items.name,
+            imageUrl: items.primaryImageUrl,
+            opens: count(analyticsEvents.id),
+          })
+          .from(items)
+          .leftJoin(
+            analyticsEvents,
+            and(
+              eq(analyticsEvents.itemId, items.id),
+              eq(analyticsEvents.eventName, "item_viewed"),
+              gte(analyticsEvents.occurredAt, since),
+            ),
+          )
+          .where(eq(items.businessId, businessId))
+          .groupBy(items.id)
+          .orderBy(desc(count(analyticsEvents.id)), items.name)
+          .limit(3)
+      : [];
 
     const catalogRows = await this.database.db
       .select({
@@ -412,19 +532,22 @@ export class BusinessService {
       .where(eq(auditEvents.businessId, businessId))
       .orderBy(desc(auditEvents.occurredAt))
       .limit(8);
-    const qrRows = await this.database.db
-      .select({
-        id: qrCodes.id,
-        name: qrCodes.name,
-        token: qrCodes.publicToken,
-        active: qrCodes.active,
-      })
-      .from(qrCodes)
-      .where(eq(qrCodes.businessId, businessId))
-      .limit(10);
+    const qrRows = canReadQr
+      ? await this.database.db
+          .select({
+            id: qrCodes.id,
+            name: qrCodes.name,
+            token: qrCodes.publicToken,
+            active: qrCodes.active,
+          })
+          .from(qrCodes)
+          .where(eq(qrCodes.businessId, businessId))
+          .limit(10)
+      : [];
 
     return {
       business,
+      capabilities: { analytics: canViewAnalytics, qr: canReadQr },
       metrics: {
         catalogViews: metric?.catalogViews ?? 0,
         qrScans: scanMetric?.scans ?? 0,
@@ -449,22 +572,25 @@ export class BusinessService {
 export class EntitlementService {
   constructor(private readonly database: DatabaseService) {}
 
-  async value(businessId: string, key: string) {
+  async configuration(businessId: string, key: string) {
     const [row] = await this.database.db
-      .select({ value: planEntitlements.value })
+      .select({
+        status: subscriptions.status,
+        planActive: plans.active,
+        value: planEntitlements.value,
+      })
       .from(subscriptions)
-      .innerJoin(
+      .innerJoin(plans, eq(plans.id, subscriptions.planId))
+      .leftJoin(
         planEntitlements,
-        eq(planEntitlements.planId, subscriptions.planId),
-      )
-      .where(
         and(
-          eq(subscriptions.businessId, businessId),
+          eq(planEntitlements.planId, subscriptions.planId),
           eq(planEntitlements.key, key),
         ),
       )
+      .where(eq(subscriptions.businessId, businessId))
       .limit(1);
-    return row?.value;
+    return row;
   }
 
   async assertWithinLimit(
@@ -472,9 +598,8 @@ export class EntitlementService {
     entitlementKey: string,
     currentCount: number,
   ) {
-    const limit = await this.value(businessId, entitlementKey);
-    if (typeof limit === "number" && currentCount >= limit)
-      throw new Error(`Plan limit reached for ${entitlementKey}`);
+    const configuration = await this.configuration(businessId, entitlementKey);
+    assertPlanLimit(configuration, entitlementKey, currentCount);
   }
 }
 
@@ -525,7 +650,10 @@ export class BusinessController {
     @Req() request: AuthenticatedRequest,
   ) {
     return {
-      data: await this.businesses.dashboard(context.businessId!),
+      data: await this.businesses.dashboard(
+        context.businessId!,
+        context.permissions ?? [],
+      ),
       requestId: String(request.id),
     };
   }

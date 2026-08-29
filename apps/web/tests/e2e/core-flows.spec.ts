@@ -1,7 +1,7 @@
 import { expect, test } from "@playwright/test";
 
 const apiOrigin = new URL(
-  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4100/api/v1",
+  process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000/api/v1",
 ).origin;
 
 async function signIn(page: import("@playwright/test").Page) {
@@ -73,11 +73,25 @@ test("public catalog supports search, categories, favorite, and item details", a
   await page.getByPlaceholder("Search the menu").fill("");
   await page.getByRole("tab", { name: "Coffee" }).click();
   await expect(page.getByRole("heading", { name: "Espresso" })).toBeVisible();
+  await page.getByRole("button", { name: "Add Espresso to favorites" }).click();
+  await expect(
+    page.getByRole("button", { name: "Remove Espresso from favorites" }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "Show favorites" }).click();
+  await expect(page.getByRole("heading", { name: "Espresso" })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "Pistachio latte" }),
+  ).toBeHidden();
   await page.getByRole("button", { name: "Open details for Espresso" }).click();
   await expect(
     page.getByRole("dialog").getByRole("heading", { name: "Espresso" }),
   ).toBeVisible();
   await expect(page.getByText("Small")).toBeVisible();
+
+  await page.goto("/b/brew-bloom/all-day-menu#espresso");
+  await expect(
+    page.getByRole("dialog").getByRole("heading", { name: "Espresso" }),
+  ).toBeVisible();
 });
 
 test("Persian public catalog switches to RTL", async ({ page }) => {

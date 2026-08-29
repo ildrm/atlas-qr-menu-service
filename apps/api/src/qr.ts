@@ -5,7 +5,9 @@ import {
   Controller,
   Get,
   Injectable,
+  NotFoundException,
   Param,
+  ParseUUIDPipe,
   Post,
   Req,
   Res,
@@ -14,12 +16,14 @@ import {
   auditEvents,
   branches,
   businesses,
+  campaigns,
+  catalogBranches,
   catalogs,
   outboxEvents,
   qrCodes,
 } from "@atlas/database";
 import { createQrSchema } from "@atlas/contracts";
-import { and, count, eq, gt, isNull, or } from "drizzle-orm";
+import { and, count, eq, gt, isNull, lte, or, sql } from "drizzle-orm";
 import QRCode from "qrcode";
 import type { FastifyReply } from "fastify";
 
@@ -34,6 +38,11 @@ import {
 } from "./common.js";
 import { appConfig } from "./config.js";
 import { DatabaseService } from "./database.service.js";
+import {
+  classifyDevice,
+  hashPublicVisitor,
+  normalizePublicLocale,
+} from "./visitor-privacy.js";
 
 function tokenHash(token: string) {
   return createHash("sha256").update(token).digest("hex");
@@ -71,17 +80,21 @@ export class QrService {
     requestId: string,
   ) {
     const input = parseBody(createQrSchema, body);
-    const [usage] = await this.database.db
-      .select({ value: count() })
-      .from(qrCodes)
-      .where(eq(qrCodes.businessId, businessId));
-    await this.entitlements.assertWithinLimit(
-      businessId,
-      "max.qr_codes",
-      usage?.value ?? 0,
-    );
-    if (input.targetType === "catalog") {
-      const [catalog] = await this.database.db
+    return this.database.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${`${businessId}:max.qr_codes`}))`,
+      );
+      const [usage] = await transaction
+        .select({ value: count() })
+        .from(qrCodes)
+        .where(eq(qrCodes.businessId, businessId));
+      await this.entitlements.assertWithinLimit(
+        businessId,
+        "max.qr_codes",
+        usage?.value ?? 0,
+      );
+
+      const [catalog] = await transaction
         .select({ id: catalogs.id })
         .from(catalogs)
         .where(
@@ -91,44 +104,84 @@ export class QrService {
           ),
         )
         .limit(1);
-      if (!catalog)
-        throw new Error("QR target does not belong to this business");
-    }
-    const publicToken = randomBytes(18).toString("base64url");
-    const context = Object.fromEntries(
-      Object.entries(input.context).filter(
-        (entry): entry is [string, string] => typeof entry[1] === "string",
-      ),
-    );
-    const [qr] = await this.database.db
-      .insert(qrCodes)
-      .values({
+      if (!catalog) throw new NotFoundException("QR target is not available");
+
+      if (input.branchId) {
+        const [assignment] = await transaction
+          .select({ id: branches.id })
+          .from(branches)
+          .innerJoin(
+            catalogBranches,
+            and(
+              eq(catalogBranches.branchId, branches.id),
+              eq(catalogBranches.catalogId, input.targetId),
+            ),
+          )
+          .where(
+            and(
+              eq(branches.id, input.branchId),
+              eq(branches.businessId, businessId),
+              eq(branches.visible, true),
+            ),
+          )
+          .limit(1);
+        if (!assignment)
+          throw new NotFoundException(
+            "QR branch must be a visible branch assigned to the target catalog",
+          );
+      }
+
+      if (input.campaignId) {
+        const [campaign] = await transaction
+          .select({ id: campaigns.id })
+          .from(campaigns)
+          .where(
+            and(
+              eq(campaigns.id, input.campaignId),
+              eq(campaigns.businessId, businessId),
+            ),
+          )
+          .limit(1);
+        if (!campaign)
+          throw new NotFoundException("QR campaign is not available");
+      }
+
+      const publicToken = randomBytes(18).toString("base64url");
+      const context = Object.fromEntries(
+        Object.entries(input.context).filter(
+          (entry): entry is [string, string] => typeof entry[1] === "string",
+        ),
+      );
+      const [qr] = await transaction
+        .insert(qrCodes)
+        .values({
+          businessId,
+          branchId: input.branchId,
+          campaignId: input.campaignId,
+          name: input.name,
+          publicToken,
+          tokenHash: tokenHash(publicToken),
+          targetType: input.targetType,
+          targetId: input.targetId,
+          context,
+          style: input.style,
+          createdBy: userId,
+        })
+        .returning();
+      if (!qr) throw new Error("Could not create QR code");
+      await transaction.insert(auditEvents).values({
         businessId,
-        branchId: input.branchId,
-        campaignId: input.campaignId,
-        name: input.name,
-        publicToken,
-        tokenHash: tokenHash(publicToken),
-        targetType: input.targetType,
-        targetId: input.targetId,
-        context,
-        style: input.style,
-        createdBy: userId,
-      })
-      .returning();
-    if (!qr) throw new Error("Could not create QR code");
-    await this.database.db.insert(auditEvents).values({
-      businessId,
-      actorUserId: userId,
-      action: "qr.created",
-      entityType: "qr_code",
-      entityId: qr.id,
-      requestId,
+        actorUserId: userId,
+        action: "qr.created",
+        entityType: "qr_code",
+        entityId: qr.id,
+        requestId,
+      });
+      return {
+        ...qr,
+        resolverUrl: `${appConfig.PUBLIC_QR_BASE_URL}/${qr.publicToken}`,
+      };
     });
-    return {
-      ...qr,
-      resolverUrl: `${appConfig.PUBLIC_QR_BASE_URL}/${qr.publicToken}`,
-    };
   }
 
   async svg(businessId: string, qrCodeId: string) {
@@ -165,6 +218,7 @@ export class QrService {
         id: qrCodes.id,
         businessId: qrCodes.businessId,
         branchId: qrCodes.branchId,
+        campaignId: qrCodes.campaignId,
         targetType: qrCodes.targetType,
         targetId: qrCodes.targetId,
         context: qrCodes.context,
@@ -190,6 +244,7 @@ export class QrService {
           eq(catalogs.businessId, qr.businessId),
           eq(catalogs.status, "published"),
           eq(businesses.public, true),
+          isNull(businesses.suspendedAt),
         ),
       )
       .limit(1);
@@ -198,14 +253,47 @@ export class QrService {
       ? await this.database.db
           .select({ slug: branches.slug })
           .from(branches)
+          .innerJoin(
+            catalogBranches,
+            and(
+              eq(catalogBranches.branchId, branches.id),
+              eq(catalogBranches.catalogId, qr.targetId),
+            ),
+          )
           .where(
             and(
               eq(branches.id, qr.branchId),
               eq(branches.businessId, qr.businessId),
+              eq(branches.visible, true),
             ),
           )
           .limit(1)
       : [];
+    if (qr.branchId && !branch) return null;
+    if (qr.campaignId) {
+      const now = new Date();
+      const [campaign] = await this.database.db
+        .select({ id: campaigns.id })
+        .from(campaigns)
+        .where(
+          and(
+            eq(campaigns.id, qr.campaignId),
+            eq(campaigns.businessId, qr.businessId),
+            eq(campaigns.active, true),
+            or(isNull(campaigns.startsAt), lte(campaigns.startsAt, now)),
+            or(isNull(campaigns.endsAt), gt(campaigns.endsAt, now)),
+          ),
+        )
+        .limit(1);
+      if (!campaign) return null;
+    }
+    const userAgent = request.headers["user-agent"];
+    const visitorHash = hashPublicVisitor(
+      appConfig.SESSION_PEPPER,
+      "qr",
+      qr.businessId,
+      `${request.ip.slice(0, 64)}|${userAgent?.slice(0, 500) ?? ""}`,
+    );
     await this.database.db.insert(outboxEvents).values({
       businessId: qr.businessId,
       eventType: "qr.scanned",
@@ -213,9 +301,13 @@ export class QrService {
       aggregateId: qr.id,
       payload: {
         qrCodeId: qr.id,
-        locale: qr.context.locale,
-        ip: request.ip,
-        userAgent: request.headers["user-agent"]?.slice(0, 500),
+        visitorHash,
+        locale: normalizePublicLocale(
+          qr.context.locale,
+          request.headers["accept-language"],
+        ),
+        deviceClass: classifyDevice(userAgent),
+        occurredAt: new Date().toISOString(),
       },
     });
     const url = new URL(
@@ -268,7 +360,7 @@ export class QrController {
   @RequirePermission("qr.read")
   @Get("api/v1/businesses/:businessId/qr-codes/:qrCodeId.svg")
   async svg(
-    @Param("qrCodeId") qrCodeId: string,
+    @Param("qrCodeId", new ParseUUIDPipe()) qrCodeId: string,
     @CurrentAuth() context: RequestAuthContext,
     @Res() response: FastifyReply,
   ) {

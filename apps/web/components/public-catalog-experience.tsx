@@ -60,6 +60,7 @@ export function PublicCatalogExperience({
   const [search, setSearch] = useState("");
   const [availableOnly, setAvailableOnly] = useState(false);
   const [favorites, setFavorites] = useState<Set<string>>(new Set());
+  const [favoritesOnly, setFavoritesOnly] = useState(false);
   const [selectedItem, setSelectedItem] = useState<PublicCatalogItem | null>(
     null,
   );
@@ -73,6 +74,7 @@ export function PublicCatalogExperience({
       eventName: string,
       properties: Record<string, string | number | boolean | null> = {},
       itemId?: string,
+      categoryId?: string,
     ) => {
       const visitorIdKey = "atlasqr:visitor";
       let visitorId = localStorage.getItem(visitorIdKey);
@@ -87,6 +89,7 @@ export function PublicCatalogExperience({
           eventName,
           businessId: catalog.business.id,
           catalogId: catalog.catalog.id,
+          categoryId,
           itemId,
           visitorId,
           properties,
@@ -102,7 +105,19 @@ export function PublicCatalogExperience({
       `atlasqr:favorites:${catalog.business.id}`,
     );
     queueMicrotask(() => {
-      if (saved) setFavorites(new Set(JSON.parse(saved) as string[]));
+      if (saved) {
+        try {
+          const parsed: unknown = JSON.parse(saved);
+          if (
+            Array.isArray(parsed) &&
+            parsed.every((entry): entry is string => typeof entry === "string")
+          ) {
+            setFavorites(new Set(parsed));
+          }
+        } catch {
+          // Ignore corrupt client-only preferences and keep the catalog usable.
+        }
+      }
       setOnline(navigator.onLine);
     });
     const onlineHandler = () => setOnline(true);
@@ -123,6 +138,27 @@ export function PublicCatalogExperience({
     });
   }, [context.qr, context.room, context.table, track]);
 
+  useEffect(() => {
+    const openLinkedItem = () => {
+      let slug: string;
+      try {
+        slug = decodeURIComponent(window.location.hash.slice(1));
+      } catch {
+        return;
+      }
+      if (!slug) {
+        setSelectedItem(null);
+        return;
+      }
+      const item = catalog.items.find((entry) => entry.slug === slug);
+      setSelectedItem(item ?? null);
+    };
+
+    openLinkedItem();
+    window.addEventListener("hashchange", openLinkedItem);
+    return () => window.removeEventListener("hashchange", openLinkedItem);
+  }, [catalog.items]);
+
   const visibleItems = useMemo(
     () =>
       catalog.items.filter((item) => {
@@ -135,10 +171,20 @@ export function PublicCatalogExperience({
             .toLowerCase()
             .includes(search.toLowerCase());
         return (
-          categoryMatch && searchMatch && (!availableOnly || item.available)
+          categoryMatch &&
+          searchMatch &&
+          (!availableOnly || item.available) &&
+          (!favoritesOnly || favorites.has(item.id))
         );
       }),
-    [activeCategory, availableOnly, catalog.items, search],
+    [
+      activeCategory,
+      availableOnly,
+      catalog.items,
+      favorites,
+      favoritesOnly,
+      search,
+    ],
   );
 
   function toggleFavorite(item: PublicCatalogItem) {
@@ -251,10 +297,14 @@ export function PublicCatalogExperience({
             onClick={() => {
               setActiveCategory("all");
               setSearch("");
+              setFavoritesOnly((value) => !value);
             }}
-            aria-label="Show all favorites"
+            aria-label={favoritesOnly ? "Show all items" : "Show favorites"}
+            aria-pressed={favoritesOnly}
           >
-            <Heart className={favorites.size ? "filled" : ""} />
+            <Heart
+              className={favoritesOnly || favorites.size ? "filled" : ""}
+            />
           </button>
           <button
             className="public-search-button"
@@ -346,7 +396,12 @@ export function PublicCatalogExperience({
                 className={activeCategory === category.id ? "active" : ""}
                 onClick={() => {
                   setActiveCategory(category.id);
-                  void track("category_viewed", { category: category.slug });
+                  void track(
+                    "category_viewed",
+                    { category: category.slug },
+                    undefined,
+                    category.id,
+                  );
                 }}
               >
                 {category.name}
@@ -434,6 +489,7 @@ export function PublicCatalogExperience({
                   setSearch("");
                   setActiveCategory("all");
                   setAvailableOnly(false);
+                  setFavoritesOnly(false);
                 }}
               >
                 Clear filters

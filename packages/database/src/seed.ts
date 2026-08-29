@@ -43,6 +43,10 @@ loadEnvironment({
 
 const databaseUrl = process.env.DATABASE_URL;
 if (!databaseUrl) throw new Error("DATABASE_URL is required");
+if (process.env.NODE_ENV === "production")
+  throw new Error(
+    "Refusing to load demo fixtures when NODE_ENV=production. Use an explicit production data migration instead.",
+  );
 
 const { db, pool } = createDatabase(databaseUrl);
 
@@ -165,14 +169,34 @@ const freeEntitlements: Array<{ key: string; value: number | boolean }> = [
   { key: "feature.custom_domain", value: false },
   { key: "feature.ai", value: false },
 ];
-for (const entitlement of freeEntitlements) {
-  await db
-    .insert(planEntitlements)
-    .values({ planId: ids.freePlan, ...entitlement })
-    .onConflictDoUpdate({
-      target: [planEntitlements.planId, planEntitlements.key],
-      set: { value: entitlement.value },
-    });
+const professionalEntitlements: Array<{
+  key: string;
+  value: string | boolean;
+}> = [
+  { key: "max.businesses", value: "unlimited" },
+  { key: "max.branches", value: "unlimited" },
+  { key: "max.catalogs", value: "unlimited" },
+  { key: "max.items", value: "unlimited" },
+  { key: "max.qr_codes", value: "unlimited" },
+  { key: "max.team_members", value: "unlimited" },
+  { key: "max.languages", value: "unlimited" },
+  { key: "feature.analytics", value: true },
+  { key: "feature.custom_domain", value: true },
+  { key: "feature.ai", value: false },
+];
+for (const [planId, entitlements] of [
+  [ids.freePlan, freeEntitlements],
+  [ids.proPlan, professionalEntitlements],
+] as const) {
+  for (const entitlement of entitlements) {
+    await db
+      .insert(planEntitlements)
+      .values({ planId, ...entitlement })
+      .onConflictDoUpdate({
+        target: [planEntitlements.planId, planEntitlements.key],
+        set: { value: entitlement.value },
+      });
+  }
 }
 
 const [existingCafe] = await db

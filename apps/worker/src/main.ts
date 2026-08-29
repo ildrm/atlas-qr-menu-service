@@ -48,24 +48,30 @@ type OutboxRow = {
   event_type: string;
   aggregate_id: string | null;
   payload: Record<string, unknown>;
+  created_at: Date | string;
 };
+
+const OUTBOX_LEASE_MS = 5 * 60 * 1_000;
 
 async function claimOutboxBatch() {
   const client = await pool.connect();
   try {
     await client.query("begin");
     const result = await client.query<OutboxRow>(`
-      select id, business_id, event_type, aggregate_id, payload
+      select id, business_id, event_type, aggregate_id, payload, created_at
       from outbox_events
-      where status = 'pending' and available_at <= now()
+      where status in ('pending', 'processing') and available_at <= now()
       order by created_at
       for update skip locked
       limit 50
     `);
     if (result.rows.length) {
       await client.query(
-        "update outbox_events set status = 'processing', attempts = attempts + 1 where id = any($1::uuid[])",
-        [result.rows.map((row) => row.id)],
+        "update outbox_events set status = 'processing', attempts = attempts + 1, available_at = $2, last_error = null where id = any($1::uuid[])",
+        [
+          result.rows.map((row) => row.id),
+          new Date(Date.now() + OUTBOX_LEASE_MS),
+        ],
       );
     }
     await client.query("commit");
@@ -94,6 +100,7 @@ async function pumpOutbox() {
         .update(outboxEvents)
         .set({
           status: "pending",
+          availableAt: new Date(Date.now() + 30_000),
           lastError:
             error instanceof Error
               ? error.message.slice(0, 1_000)
@@ -108,51 +115,76 @@ const worker = new Worker<OutboxRow>(
   "atlas-domain-events",
   async (job) => {
     const row = job.data;
-    if (!row.business_id) return;
-    if (row.event_type === "analytics.ingest") {
-      const payload = row.payload as {
-        eventName: string;
-        visitorHash?: string;
-        catalogId?: string;
-        categoryId?: string;
-        itemId?: string;
-        qrCodeId?: string;
-        properties?: Record<string, string | number | boolean | null>;
-      };
-      await db.insert(analyticsEvents).values({
-        businessId: row.business_id,
-        eventName: payload.eventName,
-        visitorHash: payload.visitorHash,
-        catalogId: payload.catalogId,
-        categoryId: payload.categoryId,
-        itemId: payload.itemId,
-        qrCodeId: payload.qrCodeId,
-        properties: payload.properties ?? {},
-      });
-    } else if (row.event_type === "qr.scanned") {
-      const payload = row.payload as {
-        qrCodeId: string;
-        locale?: string;
-        ip?: string;
-        userAgent?: string;
-      };
-      const visitorHash = createHmac("sha256", config.SESSION_PEPPER)
-        .update(`${payload.ip ?? ""}|${payload.userAgent ?? ""}`)
-        .digest("hex");
-      await db.insert(qrScans).values({
-        businessId: row.business_id,
-        qrCodeId: payload.qrCodeId,
-        visitorHash,
-        locale: payload.locale,
-        deviceClass: /mobile/i.test(payload.userAgent ?? "")
-          ? "mobile"
-          : "desktop",
-      });
-    }
-    await db
-      .update(outboxEvents)
-      .set({ status: "delivered", processedAt: new Date(), lastError: null })
-      .where(eq(outboxEvents.id, row.id));
+    await db.transaction(async (transaction) => {
+      const [current] = await transaction
+        .select({ status: outboxEvents.status })
+        .from(outboxEvents)
+        .where(eq(outboxEvents.id, row.id))
+        .limit(1)
+        .for("update");
+      if (!current || current.status === "delivered") return;
+      if (current.status !== "processing")
+        throw new Error(`Outbox event ${row.id} is not leased for processing`);
+
+      const occurredAt = new Date(row.created_at);
+      const eventTime = Number.isNaN(occurredAt.valueOf())
+        ? new Date()
+        : occurredAt;
+
+      if (row.business_id && row.event_type === "analytics.ingest") {
+        const payload = row.payload as {
+          eventName: string;
+          visitorHash?: string;
+          catalogId?: string;
+          categoryId?: string;
+          itemId?: string;
+          qrCodeId?: string;
+          properties?: Record<string, string | number | boolean | null>;
+        };
+        await transaction.insert(analyticsEvents).values({
+          businessId: row.business_id,
+          eventName: payload.eventName,
+          occurredAt: eventTime,
+          visitorHash: payload.visitorHash,
+          catalogId: payload.catalogId,
+          categoryId: payload.categoryId,
+          itemId: payload.itemId,
+          qrCodeId: payload.qrCodeId,
+          properties: payload.properties ?? {},
+        });
+      } else if (row.business_id && row.event_type === "qr.scanned") {
+        const payload = row.payload as {
+          qrCodeId: string;
+          visitorHash?: string;
+          locale?: string;
+          deviceClass?: string;
+          occurredAt?: string;
+        };
+        const payloadTime = payload.occurredAt
+          ? new Date(payload.occurredAt)
+          : eventTime;
+        await transaction.insert(qrScans).values({
+          businessId: row.business_id,
+          qrCodeId: payload.qrCodeId,
+          occurredAt: Number.isNaN(payloadTime.valueOf())
+            ? eventTime
+            : payloadTime,
+          visitorHash:
+            payload.visitorHash ??
+            createHmac("sha256", config.SESSION_PEPPER)
+              .update(`qr:v1:${row.business_id}:${row.id}`)
+              .digest("hex"),
+          locale: payload.locale,
+          deviceClass: payload.deviceClass,
+        });
+      } else {
+        throw new Error(`Unsupported outbox event type: ${row.event_type}`);
+      }
+      await transaction
+        .update(outboxEvents)
+        .set({ status: "delivered", processedAt: new Date(), lastError: null })
+        .where(eq(outboxEvents.id, row.id));
+    });
   },
   { connection: workerConnection, concurrency: 8 },
 );
@@ -163,9 +195,11 @@ worker.on("failed", async (job, error) => {
   await db
     .update(outboxEvents)
     .set({
-      status: terminal ? "dead_letter" : "pending",
+      status: terminal ? "dead_letter" : "processing",
       lastError: error.message.slice(0, 1_000),
-      availableAt: new Date(Date.now() + 30_000),
+      availableAt: terminal
+        ? new Date()
+        : new Date(Date.now() + OUTBOX_LEASE_MS),
     })
     .where(eq(outboxEvents.id, job.data.id));
 });

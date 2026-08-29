@@ -1,21 +1,24 @@
 import {
+  BadRequestException,
   Body,
   Controller,
   Get,
   Injectable,
   NotFoundException,
   Param,
+  ParseUUIDPipe,
   Patch,
   Post,
   Req,
+  UnprocessableEntityException,
 } from "@nestjs/common";
 import {
   auditEvents,
+  businesses,
   catalogBranches,
   catalogs,
   categories,
   items,
-  outboxEvents,
   variants,
 } from "@atlas/database";
 import {
@@ -24,7 +27,7 @@ import {
   createItemSchema,
   createVariantSchema,
 } from "@atlas/contracts";
-import { and, count, desc, eq, inArray } from "drizzle-orm";
+import { and, count, eq, sql } from "drizzle-orm";
 import { z } from "zod";
 
 import {
@@ -45,6 +48,10 @@ const availabilityUpdateSchema = z.object({
     "sold_out",
     "hidden",
   ]),
+});
+
+const catalogFilterSchema = z.object({
+  catalogId: z.uuid().optional(),
 });
 
 @Injectable()
@@ -78,16 +85,19 @@ export class CatalogService {
     requestId: string,
   ) {
     const input = parseBody(createCatalogSchema, body);
-    const [usage] = await this.database.db
-      .select({ value: count() })
-      .from(catalogs)
-      .where(eq(catalogs.businessId, businessId));
-    await this.entitlements.assertWithinLimit(
-      businessId,
-      "max.catalogs",
-      usage?.value ?? 0,
-    );
     return this.database.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${`${businessId}:max.catalogs`}))`,
+      );
+      const [usage] = await transaction
+        .select({ value: count() })
+        .from(catalogs)
+        .where(eq(catalogs.businessId, businessId));
+      await this.entitlements.assertWithinLimit(
+        businessId,
+        "max.catalogs",
+        usage?.value ?? 0,
+      );
       const [catalog] = await transaction
         .insert(catalogs)
         .values({
@@ -108,7 +118,9 @@ export class CatalogService {
             ),
         });
         if (validBranches.length !== input.branchIds.length)
-          throw new Error("A selected branch does not belong to this business");
+          throw new BadRequestException(
+            "A selected branch does not belong to this business",
+          );
         await transaction.insert(catalogBranches).values(
           input.branchIds.map((branchId) => ({
             catalogId: catalog.id,
@@ -159,53 +171,55 @@ export class CatalogService {
     requestId: string,
   ) {
     const input = parseBody(createCategorySchema, body);
-    const [catalog] = await this.database.db
-      .select({ id: catalogs.id })
-      .from(catalogs)
-      .where(
-        and(
-          eq(catalogs.id, input.catalogId),
-          eq(catalogs.businessId, businessId),
-        ),
-      )
-      .limit(1);
-    if (!catalog) throw new Error("Catalog not found");
-    if (input.parentId) {
-      const [parent] = await this.database.db
-        .select({ id: categories.id })
-        .from(categories)
+    return this.database.db.transaction(async (transaction) => {
+      const [catalog] = await transaction
+        .select({ id: catalogs.id })
+        .from(catalogs)
         .where(
           and(
-            eq(categories.id, input.parentId),
-            eq(categories.catalogId, input.catalogId),
-            eq(categories.businessId, businessId),
+            eq(catalogs.id, input.catalogId),
+            eq(catalogs.businessId, businessId),
           ),
         )
         .limit(1);
-      if (!parent) throw new Error("Parent category not found");
-    }
-    const [category] = await this.database.db
-      .insert(categories)
-      .values({
+      if (!catalog) throw new NotFoundException("Catalog not found");
+      if (input.parentId) {
+        const [parent] = await transaction
+          .select({ id: categories.id })
+          .from(categories)
+          .where(
+            and(
+              eq(categories.id, input.parentId),
+              eq(categories.catalogId, input.catalogId),
+              eq(categories.businessId, businessId),
+            ),
+          )
+          .limit(1);
+        if (!parent) throw new NotFoundException("Parent category not found");
+      }
+      const [category] = await transaction
+        .insert(categories)
+        .values({
+          businessId,
+          catalogId: input.catalogId,
+          parentId: input.parentId,
+          name: input.name,
+          slug: input.slug,
+          description: input.description,
+          sortOrder: input.sortOrder,
+        })
+        .returning();
+      if (!category) throw new Error("Could not create category");
+      await transaction.insert(auditEvents).values({
         businessId,
-        catalogId: input.catalogId,
-        parentId: input.parentId,
-        name: input.name,
-        slug: input.slug,
-        description: input.description,
-        sortOrder: input.sortOrder,
-      })
-      .returning();
-    if (!category) throw new Error("Could not create category");
-    await this.database.db.insert(auditEvents).values({
-      businessId,
-      actorUserId: userId,
-      action: "category.created",
-      entityType: "category",
-      entityId: category.id,
-      requestId,
+        actorUserId: userId,
+        action: "category.created",
+        entityType: "category",
+        entityId: category.id,
+        requestId,
+      });
+      return category;
     });
-    return category;
   }
 
   async items(businessId: string, catalogId?: string) {
@@ -248,63 +262,69 @@ export class CatalogService {
     requestId: string,
   ) {
     const input = parseBody(createItemSchema, body);
-    const [usage] = await this.database.db
-      .select({ value: count() })
-      .from(items)
-      .where(eq(items.businessId, businessId));
-    await this.entitlements.assertWithinLimit(
-      businessId,
-      "max.items",
-      usage?.value ?? 0,
-    );
-    const [category] = await this.database.db
-      .select({ id: categories.id })
-      .from(categories)
-      .innerJoin(catalogs, eq(catalogs.id, categories.catalogId))
-      .where(
-        and(
-          eq(categories.id, input.categoryId),
-          eq(categories.catalogId, input.catalogId),
-          eq(categories.businessId, businessId),
-          eq(catalogs.businessId, businessId),
-        ),
-      )
-      .limit(1);
-    if (!category) throw new Error("Category or catalog not found");
-    const [item] = await this.database.db
-      .insert(items)
-      .values({
+    return this.database.db.transaction(async (transaction) => {
+      await transaction.execute(
+        sql`select pg_advisory_xact_lock(hashtext(${`${businessId}:max.items`}))`,
+      );
+      const [usage] = await transaction
+        .select({ value: count() })
+        .from(items)
+        .where(eq(items.businessId, businessId));
+      await this.entitlements.assertWithinLimit(
         businessId,
-        catalogId: input.catalogId,
-        categoryId: input.categoryId,
-        name: input.name,
-        slug: input.slug,
-        shortDescription: input.shortDescription,
-        description: input.description,
-        sku: input.sku,
-        primaryImageUrl: input.primaryImageUrl,
-        priceMinor: input.priceMinor,
-        promotionalPriceMinor: input.promotionalPriceMinor,
-        currency: input.currency,
-        durationMinutes: input.durationMinutes,
-        tags: input.tags,
-        badges: input.badges,
-        featured: input.featured,
-        popular: input.popular,
-        sortOrder: input.sortOrder,
-      })
-      .returning();
-    if (!item) throw new Error("Could not create item");
-    await this.database.db.insert(auditEvents).values({
-      businessId,
-      actorUserId: userId,
-      action: "item.created",
-      entityType: "item",
-      entityId: item.id,
-      requestId,
-      metadata: { priceMinor: item.priceMinor, currency: item.currency },
+        "max.items",
+        usage?.value ?? 0,
+      );
+      const [category] = await transaction
+        .select({ id: categories.id })
+        .from(categories)
+        .innerJoin(catalogs, eq(catalogs.id, categories.catalogId))
+        .where(
+          and(
+            eq(categories.id, input.categoryId),
+            eq(categories.catalogId, input.catalogId),
+            eq(categories.businessId, businessId),
+            eq(catalogs.businessId, businessId),
+          ),
+        )
+        .limit(1);
+      if (!category)
+        throw new NotFoundException("Category or catalog not found");
+      const [item] = await transaction
+        .insert(items)
+        .values({
+          businessId,
+          catalogId: input.catalogId,
+          categoryId: input.categoryId,
+          name: input.name,
+          slug: input.slug,
+          shortDescription: input.shortDescription,
+          description: input.description,
+          sku: input.sku,
+          primaryImageUrl: input.primaryImageUrl,
+          priceMinor: input.priceMinor,
+          promotionalPriceMinor: input.promotionalPriceMinor,
+          currency: input.currency,
+          durationMinutes: input.durationMinutes,
+          tags: input.tags,
+          badges: input.badges,
+          featured: input.featured,
+          popular: input.popular,
+          sortOrder: input.sortOrder,
+        })
+        .returning();
+      if (!item) throw new Error("Could not create item");
+      await transaction.insert(auditEvents).values({
+        businessId,
+        actorUserId: userId,
+        action: "item.created",
+        entityType: "item",
+        entityId: item.id,
+        requestId,
+        metadata: { priceMinor: item.priceMinor, currency: item.currency },
+      });
+      return item;
     });
-    return item;
   }
 
   async createVariant(
@@ -314,34 +334,38 @@ export class CatalogService {
     requestId: string,
   ) {
     const input = parseBody(createVariantSchema, body);
-    const [item] = await this.database.db
-      .select({ id: items.id })
-      .from(items)
-      .where(and(eq(items.id, input.itemId), eq(items.businessId, businessId)))
-      .limit(1);
-    if (!item) throw new NotFoundException("Item not found");
-    const [variant] = await this.database.db
-      .insert(variants)
-      .values({
+    return this.database.db.transaction(async (transaction) => {
+      const [item] = await transaction
+        .select({ id: items.id })
+        .from(items)
+        .where(
+          and(eq(items.id, input.itemId), eq(items.businessId, businessId)),
+        )
+        .limit(1);
+      if (!item) throw new NotFoundException("Item not found");
+      const [variant] = await transaction
+        .insert(variants)
+        .values({
+          businessId,
+          itemId: input.itemId,
+          label: input.label,
+          sku: input.sku,
+          priceMinor: input.priceMinor,
+          promotionalPriceMinor: input.promotionalPriceMinor,
+          sortOrder: input.sortOrder,
+        })
+        .returning();
+      if (!variant) throw new Error("Could not create variant");
+      await transaction.insert(auditEvents).values({
         businessId,
-        itemId: input.itemId,
-        label: input.label,
-        sku: input.sku,
-        priceMinor: input.priceMinor,
-        promotionalPriceMinor: input.promotionalPriceMinor,
-        sortOrder: input.sortOrder,
-      })
-      .returning();
-    if (!variant) throw new Error("Could not create variant");
-    await this.database.db.insert(auditEvents).values({
-      businessId,
-      actorUserId: userId,
-      action: "variant.created",
-      entityType: "variant",
-      entityId: variant.id,
-      requestId,
+        actorUserId: userId,
+        action: "variant.created",
+        entityType: "variant",
+        entityId: variant.id,
+        requestId,
+      });
+      return variant;
     });
-    return variant;
   }
 
   async updateAvailability(
@@ -352,22 +376,24 @@ export class CatalogService {
     requestId: string,
   ) {
     const input = parseBody(availabilityUpdateSchema, body);
-    const [item] = await this.database.db
-      .update(items)
-      .set({ availability: input.availability, updatedAt: new Date() })
-      .where(and(eq(items.id, itemId), eq(items.businessId, businessId)))
-      .returning();
-    if (!item) throw new NotFoundException("Item not found");
-    await this.database.db.insert(auditEvents).values({
-      businessId,
-      actorUserId: userId,
-      action: "item.availability_updated",
-      entityType: "item",
-      entityId: item.id,
-      requestId,
-      metadata: { availability: input.availability },
+    return this.database.db.transaction(async (transaction) => {
+      const [item] = await transaction
+        .update(items)
+        .set({ availability: input.availability, updatedAt: new Date() })
+        .where(and(eq(items.id, itemId), eq(items.businessId, businessId)))
+        .returning();
+      if (!item) throw new NotFoundException("Item not found");
+      await transaction.insert(auditEvents).values({
+        businessId,
+        actorUserId: userId,
+        action: "item.availability_updated",
+        entityType: "item",
+        entityId: item.id,
+        requestId,
+        metadata: { availability: input.availability },
+      });
+      return item;
     });
-    return item;
   }
 
   async publish(
@@ -377,20 +403,42 @@ export class CatalogService {
     requestId: string,
   ) {
     return this.database.db.transaction(async (transaction) => {
-      const [current] = await transaction
-        .select({ publishedRevision: catalogs.publishedRevision })
+      const [existing] = await transaction
+        .select({ id: catalogs.id })
         .from(catalogs)
         .where(
           and(eq(catalogs.id, catalogId), eq(catalogs.businessId, businessId)),
         )
         .limit(1);
-      if (!current) throw new NotFoundException("Catalog not found");
+      if (!existing) throw new NotFoundException("Catalog not found");
+      const [eligible] = await transaction
+        .select({ value: count() })
+        .from(items)
+        .innerJoin(
+          categories,
+          and(
+            eq(categories.id, items.categoryId),
+            eq(categories.businessId, items.businessId),
+            eq(categories.catalogId, items.catalogId),
+          ),
+        )
+        .where(
+          and(
+            eq(items.catalogId, catalogId),
+            eq(items.businessId, businessId),
+            eq(categories.visible, true),
+          ),
+        );
+      if ((eligible?.value ?? 0) === 0)
+        throw new UnprocessableEntityException(
+          "Add at least one item in a visible category before publishing",
+        );
       const [catalog] = await transaction
         .update(catalogs)
         .set({
           status: "published",
           publishedAt: new Date(),
-          publishedRevision: current.publishedRevision + 1,
+          publishedRevision: sql`${catalogs.publishedRevision} + 1`,
           updatedAt: new Date(),
         })
         .where(
@@ -398,6 +446,10 @@ export class CatalogService {
         )
         .returning();
       if (!catalog) throw new NotFoundException("Catalog not found");
+      await transaction
+        .update(businesses)
+        .set({ public: true, updatedAt: new Date() })
+        .where(eq(businesses.id, businessId));
       await transaction
         .update(items)
         .set({ status: "published", updatedAt: new Date() })
@@ -412,16 +464,6 @@ export class CatalogService {
         entityId: catalog.id,
         requestId,
         metadata: { revision: catalog.publishedRevision },
-      });
-      await transaction.insert(outboxEvents).values({
-        businessId,
-        eventType: "catalog.published",
-        aggregateType: "catalog",
-        aggregateId: catalog.id,
-        payload: {
-          catalogId: catalog.id,
-          revision: catalog.publishedRevision,
-        },
       });
       return catalog;
     });
@@ -465,7 +507,7 @@ export class CatalogController {
   @RequirePermission("catalog.publish")
   @Post("catalogs/:catalogId/publish")
   async publish(
-    @Param("catalogId") catalogId: string,
+    @Param("catalogId", new ParseUUIDPipe()) catalogId: string,
     @CurrentAuth() context: RequestAuthContext,
     @Req() request: AuthenticatedRequest,
   ) {
@@ -486,7 +528,7 @@ export class CatalogController {
     @CurrentAuth() context: RequestAuthContext,
     @Req() request: AuthenticatedRequest,
   ) {
-    const catalogId = (request.query as { catalogId?: string }).catalogId;
+    const { catalogId } = parseBody(catalogFilterSchema, request.query);
     return {
       data: await this.catalogs.categories(context.businessId!, catalogId),
       requestId: String(request.id),
@@ -517,7 +559,7 @@ export class CatalogController {
     @CurrentAuth() context: RequestAuthContext,
     @Req() request: AuthenticatedRequest,
   ) {
-    const catalogId = (request.query as { catalogId?: string }).catalogId;
+    const { catalogId } = parseBody(catalogFilterSchema, request.query);
     return {
       data: await this.catalogs.items(context.businessId!, catalogId),
       requestId: String(request.id),
@@ -563,7 +605,7 @@ export class CatalogController {
   @RequirePermission("item.update")
   @Patch("items/:itemId/availability")
   async availability(
-    @Param("itemId") itemId: string,
+    @Param("itemId", new ParseUUIDPipe()) itemId: string,
     @Body() body: unknown,
     @CurrentAuth() context: RequestAuthContext,
     @Req() request: AuthenticatedRequest,

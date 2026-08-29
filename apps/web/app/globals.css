@@ -2614,9 +2614,6 @@ img {
     padding: 0;
     justify-content: center;
   }
-  .public-topbar nav > button:nth-of-type(2) {
-    display: none;
-  }
   .public-cover {
     height: 260px;
   }

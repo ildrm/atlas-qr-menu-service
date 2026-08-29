@@ -1,5 +1,6 @@
 import "reflect-metadata";
 
+import { randomUUID } from "node:crypto";
 import type { IncomingMessage } from "node:http";
 
 import cookie from "@fastify/cookie";
@@ -15,6 +16,22 @@ import { DocumentBuilder, SwaggerModule } from "@nestjs/swagger";
 import { AppModule } from "./app.module.js";
 import { appConfig } from "./config.js";
 
+const MAX_REQUEST_ID_LENGTH = 100;
+const SAFE_REQUEST_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]*$/;
+
+export function requestIdFromHeader(
+  header: string | string[] | undefined,
+): string {
+  if (
+    typeof header === "string" &&
+    header.length <= MAX_REQUEST_ID_LENGTH &&
+    SAFE_REQUEST_ID.test(header)
+  ) {
+    return header;
+  }
+  return randomUUID();
+}
+
 const adapter = new FastifyAdapter({
   logger: {
     level: appConfig.NODE_ENV === "production" ? "info" : "warn",
@@ -27,9 +44,10 @@ const adapter = new FastifyAdapter({
     ],
   },
   bodyLimit: 1_048_576,
-  trustProxy: appConfig.NODE_ENV === "production",
+  trustProxy:
+    appConfig.TRUST_PROXY_HOPS > 0 ? appConfig.TRUST_PROXY_HOPS : false,
   genReqId: (request: IncomingMessage) =>
-    String(request.headers["x-request-id"] ?? crypto.randomUUID()),
+    requestIdFromHeader(request.headers["x-request-id"]),
 });
 
 const app = await NestFactory.create<NestFastifyApplication>(
@@ -40,12 +58,23 @@ const app = await NestFactory.create<NestFastifyApplication>(
 await app.register(cookie);
 await app.register(helmet, {
   contentSecurityPolicy: {
-    directives: {
-      defaultSrc: ["'none'"],
-      frameAncestors: ["'none'"],
-      baseUri: ["'none'"],
-      formAction: ["'self'"],
-    },
+    directives:
+      appConfig.NODE_ENV === "production"
+        ? {
+            defaultSrc: ["'none'"],
+            frameAncestors: ["'none'"],
+            baseUri: ["'none'"],
+            formAction: ["'self'"],
+          }
+        : {
+            defaultSrc: ["'self'"],
+            scriptSrc: ["'self'", "'unsafe-inline'"],
+            styleSrc: ["'self'", "'unsafe-inline'"],
+            imgSrc: ["'self'", "data:"],
+            frameAncestors: ["'none'"],
+            baseUri: ["'self'"],
+            formAction: ["'self'"],
+          },
   },
   frameguard: { action: "deny" },
   hsts:
@@ -77,7 +106,7 @@ if (appConfig.NODE_ENV !== "production") {
     .addCookieAuth(appConfig.SESSION_COOKIE_NAME)
     .build();
   SwaggerModule.setup(
-    "api/docs",
+    "docs",
     app,
     SwaggerModule.createDocument(app, openApiConfig),
   );

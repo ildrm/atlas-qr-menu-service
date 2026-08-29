@@ -8,6 +8,7 @@ pnpm install --frozen-lockfile
 cp .env.example .env
 docker compose up -d postgres redis
 pnpm db:migrate
+pnpm format:check
 pnpm db:seed
 pnpm dev
 ```
@@ -45,7 +46,7 @@ Migrations are forward-only. Roll back application code only when it is compatib
 
 ## Seed behavior
 
-`pnpm db:seed` is safe to rerun for stable fixtures and creates demo credentials listed in the README. It must never be run against production because it uses a known password and synthetic analytics.
+`pnpm db:seed` is safe to rerun for stable fixtures and creates demo credentials listed in the README. The command programmatically refuses to run when `NODE_ENV=production` because it uses a known password and synthetic analytics.
 
 ## Outbox and worker
 
@@ -55,10 +56,10 @@ The worker polls unprocessed outbox rows and writes QR/analytics facts. If dashb
 2. confirm Redis readiness;
 3. query the count/age of `outbox_events.processed_at IS NULL`;
 4. inspect the most recent worker error with its event ID/request context;
-5. repair the dependency or poison event, then restart the worker;
+5. repair the dependency or poison event; for a reviewed `dead_letter` row, reset only that row to `pending`, clear `last_error`, and set `available_at = now()`;
 6. verify the backlog drains and no duplicate facts were created.
 
-Never delete the outbox backlog as a first response. Preserve failed payloads for diagnosis and replay.
+Restarting the worker does not replay `dead_letter` rows. Never delete the outbox backlog as a first response. Preserve failed payloads for diagnosis and replay, and verify the selected event type is one of the supported `analytics.ingest` or `qr.scanned` handlers.
 
 ## QR incident
 
@@ -73,7 +74,7 @@ Deactivating a compromised QR is recoverable. Deleting printed-code records is n
 
 ## Public catalog incident
 
-If owner data is correct but public content is stale, compare the catalog `published_revision` with the public response, then inspect cache revalidation. Temporarily purge only the affected catalog tag/path. Do not disable all authorization or expose drafts to work around a cache problem.
+If owner data is correct but public content is stale, compare the catalog `published_revision` with the public response and wait through the current bounded 60-second Next.js revalidation window. There is no on-demand purge endpoint or `catalog.published` invalidation consumer in this release. Do not disable authorization or expose drafts to work around a cache problem.
 
 ## Backup and restore
 
@@ -90,7 +91,7 @@ Production baseline:
 - CI typecheck, lint, unit, build, and browser tests green.
 - Migration reviewed and fresh/upgrade paths tested.
 - Secrets and provider configuration present; demo credentials absent.
-- Trusted proxy, TLS, secure cookies, CSP/CORS origins verified.
+- Trusted proxy, TLS, secure cookies, CSP/CORS origins, and `CSRF_COOKIE_DOMAIN`/same-host topology verified.
 - Restricted database role and RLS context validated.
 - Readiness gates traffic; graceful shutdown drains requests/jobs.
 - Metrics, logs, traces, alerts, backups, and rollback owner confirmed.

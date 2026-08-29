@@ -50,6 +50,7 @@ Playwright exercised:
 - favorite action;
 - Persian translated content and RTL direction;
 - desktop and mobile Chromium projects;
-- native-size dashboard and public-catalog screenshot capture.
+- favorite-only filtering and direct item deep links;
+- native-size dashboard and public-catalog screenshot capture (historical manual QA artifact).
 
-Final browser result: 10/10 core tests passed, plus 2/2 temporary native-size capture tests. The capture-only test file was removed after producing the documented implementation frames.
+The maintained suite contains five scenarios executed in desktop and mobile Chromium projects (10 executions). Native-size capture was a historical manual QA pass; its temporary capture test was removed, so it is not claimed as reproducible CI evidence.

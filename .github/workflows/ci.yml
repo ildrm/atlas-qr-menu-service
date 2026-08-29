@@ -54,7 +54,7 @@ jobs:
       - run: pnpm test
       - run: pnpm build
       - run: pnpm db:seed
-      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm --filter @atlas/web exec playwright install --with-deps chromium
       - name: Browser acceptance
         run: |
           pnpm --filter @atlas/api start > /tmp/atlas-api.log 2>&1 &
@@ -69,3 +69,14 @@ jobs:
           curl --fail http://localhost:4000/health/ready
           curl --fail http://localhost:3000/login
           pnpm test:e2e
+          pnpm --filter @atlas/database verify:worker
+      - name: Browser service logs
+        if: failure()
+        run: |
+          for log in /tmp/atlas-api.log /tmp/atlas-worker.log /tmp/atlas-web.log; do
+            if [ -f "$log" ]; then
+              echo "::group::$log"
+              tail -n 200 "$log"
+              echo "::endgroup::"
+            fi
+          done

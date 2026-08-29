@@ -25,7 +25,7 @@ Browser / QR scanner
 
 - `apps/web`: public and authenticated presentation, SSR metadata/structured data, client caching, local favorites, service worker.
 - `apps/api`: session/authentication, permission enforcement, tenant-aware business/catalog/item/QR/public/analytics services, OpenAPI, health checks.
-- `apps/worker`: polls durable outbox rows, writes normalized analytics/scan rows, marks events processed, and relies on unique processing state for retry safety.
+- `apps/worker`: leases durable outbox rows, writes normalized analytics/scan rows and marks delivery in one database transaction, retries transient failures, and dead-letters terminal failures.
 - `packages/contracts`: Zod inputs, permission vocabulary, analytics allowlist, and shared public response types.
 - `packages/database`: Drizzle schema, connection factory, migration runner, migrations, and idempotent seed.
 
@@ -39,19 +39,19 @@ Authenticated requests pass through:
 4. membership lookup for the route `businessId`;
 5. named-permission evaluation;
 6. tenant-scoped service query/mutation;
-7. audit/outbox writes for privileged or asynchronous effects.
+7. audit writes for privileged effects and outbox writes for supported asynchronous analytics/QR effects.
 
 Public catalog queries start from public business and published catalog identity, then fetch only published child rows. QR resolution validates token format/hash, active/expiry state, published destination, branch ownership, and business visibility.
 
 ## Data and tenant isolation
 
-The schema contains 38 tables. Tenant-owned tables include `business_id` directly or link through a constrained owner. Hot paths have compound business/status/slug indexes. The hardening migration adds PostgreSQL row-level security policies based on `app.business_id`, plus checks for category self-parenting and cross-tenant relationships.
+The schema contains 38 tables. Tenant-owned tables include `business_id` directly or link through a constrained owner. Hot paths have compound business/status/slug indexes. Hardening migrations add cross-tenant integrity triggers and partial PostgreSQL row-level security policies based on `app.current_business_id`.
 
-The application uses an owner database connection in local development, so it must continue to include business ownership in every query; RLS is defense in depth for restricted production roles.
+Application `businessId` predicates are the active tenant boundary. The API and worker do not yet set transaction-local tenant context, local development uses the owner role that bypasses RLS, and indirect/root tenant tables still need a complete restricted-role policy design. Restricted-role RLS integration and isolation tests are therefore production gates, not implemented defense in depth. Membership branch scopes are persisted and loaded but are likewise not enforced by every service.
 
 ## Publication and caching
 
-Draft and public state are distinct. Publication runs in one database transaction, increments a revision, publishes eligible items, and emits audit/outbox events. The public Next.js route uses a bounded 60-second revalidation window and identity tags. A production event consumer should call on-demand revalidation after `catalog.published`.
+Draft and public state are distinct. Publication runs in one database transaction, increments a revision, publishes eligible items, makes the business public, and writes an audit event. The public Next.js route uses a bounded 60-second revalidation window and identity tags. On-demand invalidation is not implemented; adding an authenticated invalidation consumer is future work.
 
 ## Analytics path
 

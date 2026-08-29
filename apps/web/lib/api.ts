@@ -1,5 +1,8 @@
 const API_URL =
   process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:4000/api/v1";
+const CSRF_STORAGE_KEY = "atlasqr:csrf";
+
+let csrfToken: string | undefined;
 
 export class ApiClientError extends Error {
   constructor(
@@ -22,6 +25,27 @@ function readCookie(name: string) {
     .join("=");
 }
 
+function readCsrfToken() {
+  const cookie = readCookie("atlas_csrf");
+  if (cookie) {
+    try {
+      return decodeURIComponent(cookie);
+    } catch {
+      // Fall through to the login-response token if the cookie is malformed.
+    }
+  }
+  if (csrfToken) return csrfToken;
+  if (typeof sessionStorage === "undefined") return undefined;
+  return sessionStorage.getItem(CSRF_STORAGE_KEY) ?? undefined;
+}
+
+function rememberCsrfToken(value: string | undefined) {
+  csrfToken = value;
+  if (typeof sessionStorage === "undefined") return;
+  if (value) sessionStorage.setItem(CSRF_STORAGE_KEY, value);
+  else sessionStorage.removeItem(CSRF_STORAGE_KEY);
+}
+
 export async function apiFetch<T>(
   path: string,
   init: RequestInit = {},
@@ -30,8 +54,8 @@ export async function apiFetch<T>(
   if (init.body && !headers.has("Content-Type"))
     headers.set("Content-Type", "application/json");
   if (init.method && !["GET", "HEAD"].includes(init.method.toUpperCase())) {
-    const csrf = readCookie("atlas_csrf");
-    if (csrf) headers.set("x-csrf-token", decodeURIComponent(csrf));
+    const csrf = readCsrfToken();
+    if (csrf) headers.set("x-csrf-token", csrf);
   }
   const response = await fetch(`${API_URL}${path}`, {
     ...init,
@@ -54,6 +78,15 @@ export async function apiFetch<T>(
       body?.error?.fieldErrors,
     );
   }
+  if (
+    typeof body.data === "object" &&
+    body.data !== null &&
+    "csrfToken" in body.data &&
+    typeof body.data.csrfToken === "string"
+  ) {
+    rememberCsrfToken(body.data.csrfToken);
+  }
+  if (path === "/auth/logout") rememberCsrfToken(undefined);
   return body.data;
 }
 

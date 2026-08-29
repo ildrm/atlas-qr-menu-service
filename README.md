@@ -12,13 +12,13 @@ AtlasQR is a multi-tenant SaaS foundation for QR menus, digital catalogs, servic
 - Owner dashboard backed by persisted metrics, activity, catalogs, items, QR codes, team membership, and themes.
 - Public catalogs with SSR metadata, structured data, search, categories, availability filters, favorites, sharing, item detail and variants, branch/room/table context, translated content, RTL, PWA caching, and honest offline state.
 - Dynamic non-guessable QR tokens whose destination can change without reprinting, with scan events processed asynchronously.
-- PostgreSQL migrations, tenant indexes, row-level security policies, seed fixtures, unit/domain tests, desktop/mobile Playwright tests, and CI.
+- PostgreSQL migrations, tenant integrity triggers and RLS policy foundations, seed fixtures, unit/domain tests, desktop/mobile Playwright tests, and CI. Restricted-role RLS enforcement remains an explicit production gate.
 
 See [requirements traceability](docs/requirements-traceability.md) for exact coverage and provider-gated capabilities.
 
 ## Stack
 
-- Node.js 22+, pnpm 10, TypeScript, Turborepo
+- Node.js >=22.12, pnpm 10, TypeScript, Turborepo
 - Next.js 16, React 19, Tailwind CSS 4, TanStack Query, Recharts
 - NestJS 11 with Fastify, OpenAPI, Zod contracts
 - PostgreSQL 17 with Drizzle ORM and RLS hardening
@@ -42,7 +42,7 @@ Default URLs:
 - Web: `http://localhost:3000`
 - API: `http://localhost:4000/api/v1`
 - Health: `http://localhost:4000/health/ready`
-- OpenAPI UI: `http://localhost:4000/docs`
+- OpenAPI UI (non-production only): `http://localhost:4000/docs`
 
 Seeded demo:
 
@@ -51,13 +51,12 @@ Seeded demo:
 - Public catalog: `/b/brew-bloom/all-day-menu?branch=downtown`
 - QR resolver: `/q/BrewBloomQR2026DemoToken`
 
-The checked-in `.env.example` uses ports 3000/4000. This workspace currently uses 3100/4100 in its ignored `.env` because other local applications occupy the defaults.
-
 ## Verification
 
 ```bash
-pnpm typecheck
+pnpm format:check
 pnpm lint
+pnpm typecheck
 pnpm test
 pnpm build
 pnpm test:e2e
@@ -85,7 +84,8 @@ docs           Prompt, architecture, security, runbook, and traceability
 - [Operations runbook](docs/runbook.md)
 - [Requirements traceability](docs/requirements-traceability.md)
 - [Design fidelity ledger](docs/design/fidelity-ledger.md)
+- [Engineering review report](docs/review-report.md)
 
 ## Production notes
 
-Rotate every secret, use a managed PostgreSQL/Redis/object-storage stack, enforce TLS, run migrations as a release job, place the API behind a trusted proxy/WAF, configure backups and observability exporters, and connect explicit email, storage, billing, and custom-domain adapters before enabling those provider-backed UI actions.
+Rotate every secret, use a managed PostgreSQL/Redis/object-storage stack, enforce TLS, run migrations as a release job, place the API behind a trusted proxy/WAF, configure backups and observability exporters, and connect explicit email, storage, billing, and custom-domain adapters before enabling those provider-backed UI actions. Use a same-host reverse proxy or configure `CSRF_COOKIE_DOMAIN` for the shared parent domain when the web and API use separate subdomains. Complete the restricted database-role/RLS and branch-scope gates documented in the security model before public production use.

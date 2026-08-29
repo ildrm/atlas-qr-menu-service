@@ -20,10 +20,10 @@
     "generate": "drizzle-kit generate",
     "migrate": "tsx src/migrate.ts",
     "seed": "tsx src/seed.ts",
+    "verify:worker": "tsx src/verify-worker.ts",
     "studio": "drizzle-kit studio",
     "typecheck": "tsc -p tsconfig.json --noEmit",
-    "lint": "tsc -p tsconfig.json --noEmit",
-    "test": "vitest run"
+    "lint": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@atlas/contracts": "workspace:*",

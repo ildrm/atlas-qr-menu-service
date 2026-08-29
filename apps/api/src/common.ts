@@ -1,4 +1,5 @@
 import {
+  BadRequestException,
   CanActivate,
   Catch,
   createParamDecorator,
@@ -23,6 +24,9 @@ export const REQUIRED_PERMISSION = Symbol("requiredPermission");
 export const Public = () => SetMetadata(IS_PUBLIC, true);
 export const RequirePermission = (permission: Permission) =>
   SetMetadata(REQUIRED_PERMISSION, permission);
+
+const UUID_PATTERN =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 
 export interface RequestAuthContext {
   userId: string;
@@ -68,6 +72,8 @@ export class PermissionGuard implements CanActivate {
     const businessId = params.businessId;
     if (!request.auth || !businessId)
       throw new ForbiddenException("Business context is required");
+    if (!UUID_PATTERN.test(businessId))
+      throw new BadRequestException("Business ID is invalid");
     const membership = await this.database.findMembership(
       request.auth.userId,
       businessId,
@@ -110,6 +116,10 @@ export class ApiExceptionFilter implements ExceptionFilter {
     if (exception instanceof HttpException) {
       const status = exception.getStatus();
       const body = exception.getResponse();
+      const bodyRecord =
+        typeof body === "object" && body !== null
+          ? (body as Record<string, unknown>)
+          : undefined;
       const message =
         typeof body === "string"
           ? body
@@ -117,17 +127,31 @@ export class ApiExceptionFilter implements ExceptionFilter {
               (body as { message?: string | string[] }).message ??
                 "Request failed",
             );
-      return response.status(status).send({
-        error: {
-          code:
-            status === 403
+      const defaultCode =
+        status === 400
+          ? "BAD_REQUEST"
+          : status === 401
+            ? "UNAUTHENTICATED"
+            : status === 403
               ? "FORBIDDEN"
               : status === 404
                 ? "NOT_FOUND"
                 : status === 409
                   ? "CONFLICT"
-                  : "REQUEST_FAILED",
+                  : status === 429
+                    ? "RATE_LIMITED"
+                    : "REQUEST_FAILED";
+      return response.status(status).send({
+        error: {
+          code:
+            typeof bodyRecord?.code === "string"
+              ? bodyRecord.code
+              : defaultCode,
           message,
+          ...(bodyRecord?.fieldErrors
+            ? { fieldErrors: bodyRecord.fieldErrors }
+            : {}),
+          ...(bodyRecord?.details ? { details: bodyRecord.details } : {}),
           requestId,
         },
       });

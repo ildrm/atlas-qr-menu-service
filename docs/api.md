@@ -1,8 +1,8 @@
 # API guide
 
-Base URL: `/api/v1`. Responses use `{ "data": ..., "requestId": "..." }`. Errors use `{ "error": { "code", "message", "fieldErrors?", "requestId" } }`.
+Base URL: `/api/v1`. Responses use `{ "data": ..., "requestId": "..." }`. Errors use `{ "error": { "code", "message", "fieldErrors?", "details?", "requestId" } }`.
 
-Interactive OpenAPI is served from `/docs` by the running API.
+Interactive OpenAPI is served from `/docs` only when `NODE_ENV` is not `production`.
 
 ## Authentication
 
@@ -13,7 +13,7 @@ Interactive OpenAPI is served from `/docs` by the running API.
 | GET    | `/auth/me`       | Return the current session user         |
 | POST   | `/auth/logout`   | Revoke the current session              |
 
-Authenticated browser requests use the HttpOnly session cookie. State-changing requests also send `x-csrf-token`, derived from the readable CSRF cookie by the web client. CORS only permits the configured web origin with credentials.
+Authenticated browser requests use the HttpOnly session cookie. State-changing requests require an explicit `x-csrf-token` that matches the session plus an exact `Origin` match to `WEB_ORIGIN`; the readable cookie alone is never accepted as proof. The web client also retains the login response token for cross-origin deployments. Prefer a same-host reverse proxy, or set `CSRF_COOKIE_DOMAIN` to a shared parent domain when the web and API use separate subdomains. CORS only permits the configured web origin with credentials.
 
 ## Businesses and onboarding
 
@@ -38,7 +38,7 @@ Authenticated browser requests use the HttpOnly session cookie. State-changing r
 | POST     | `/businesses/:businessId/variants`                    | `item.create`                      |
 | PATCH    | `/businesses/:businessId/items/:itemId/availability`  | `item.update`                      |
 
-Every service verifies both resource ID and `businessId`. Cross-tenant identifiers are returned as not found or rejected without exposing the other tenant.
+Every exposed service verifies both resource ID and `businessId`. Cross-tenant identifiers are returned as not found or rejected without exposing the other tenant. Named permissions are enforced; persisted membership branch scopes are not yet enforced across all services and remain a production gate.
 
 ## QR codes
 
@@ -49,6 +49,7 @@ Every service verifies both resource ID and `businessId`. Cross-tenant identifie
 | GET      | `/q/:token`                                      | Public validated 307 resolver             |
 
 Tokens are 24 URL-safe characters (144 random bits). The resolver preserves branch, locale, table, and room context and records scan intent through the outbox.
+QR creation currently accepts catalog destinations only. Campaign ownership and activity are validated, but campaigns are not added to the redirect query string.
 
 ## Public catalog and analytics
 
@@ -57,12 +58,12 @@ Tokens are 24 URL-safe characters (144 random bits). The resolver preserves bran
 | GET    | `/public/businesses/:businessSlug/catalogs/:catalogSlug` | Published localized catalog; accepts `locale` and `branch` |
 | POST   | `/public/analytics`                                      | Allowlisted, reference-validated anonymous event           |
 
-Public endpoints return only visible businesses and published content. Price values are integer minor units at persistence boundaries and numbers in the public JSON contract.
+Public catalog endpoints return HTTP 404 unless the business, catalog, optional branch assignment, categories, and items satisfy their visibility/publication boundaries. Analytics events require references appropriate to the event type and validate those references against the same published tenant hierarchy. Price values are integer minor units at persistence boundaries and numbers in the public JSON contract.
 
 ## Health
 
 - `GET /health/live`: process liveness.
-- `GET /health/ready`: PostgreSQL and Redis dependency readiness.
+- `GET /health/ready`: PostgreSQL and Redis dependency readiness; returns HTTP 503 when either dependency is unavailable.
 
 ## Example public request
 

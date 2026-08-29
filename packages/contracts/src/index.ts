@@ -162,17 +162,9 @@ export const createVariantSchema = z.object({
 
 export const createQrSchema = z.object({
   name: z.string().trim().min(2).max(140),
-  targetType: z.enum([
-    "business",
-    "branch",
-    "catalog",
-    "category",
-    "item",
-    "promotion",
-    "table",
-    "room",
-    "campaign",
-  ]),
+  // Catalog is the only target currently implemented by the public resolver.
+  // Keep the write contract aligned with what can actually be served.
+  targetType: z.literal("catalog"),
   targetId: z.uuid(),
   branchId: z.uuid().optional(),
   campaignId: z.uuid().optional(),
@@ -195,6 +187,14 @@ export const createQrSchema = z.object({
         .default("#FFFFFF"),
       errorCorrection: z.enum(["L", "M", "Q", "H"]).default("M"),
     })
+    .superRefine((style, context) => {
+      if (contrastRatio(style.foreground, style.background) < 4.5)
+        context.addIssue({
+          code: "custom",
+          path: ["foreground"],
+          message: "QR foreground and background must have safe contrast",
+        });
+    })
     .default({
       foreground: "#14352B",
       background: "#FFFFFF",
@@ -216,21 +216,61 @@ export const analyticsEventNames = [
   "cta_clicked",
 ] as const;
 
-export const ingestAnalyticsSchema = z.object({
-  eventName: z.enum(analyticsEventNames),
-  businessId: z.uuid(),
-  catalogId: z.uuid().optional(),
-  categoryId: z.uuid().optional(),
-  itemId: z.uuid().optional(),
-  qrCodeId: z.uuid().optional(),
-  visitorId: z.string().max(100).optional(),
-  properties: z
-    .record(
-      z.string(),
-      z.union([z.string(), z.number(), z.boolean(), z.null()]),
-    )
-    .default({}),
-});
+const analyticsPropertyKeySchema = z
+  .string()
+  .min(1)
+  .max(80)
+  .regex(/^[A-Za-z0-9_.-]+$/, "Use a simple analytics property key");
+const analyticsPropertyValueSchema = z.union([
+  z.string().max(500),
+  z.number(),
+  z.boolean(),
+  z.null(),
+]);
+
+const requiredAnalyticsReferences = {
+  business_viewed: [],
+  catalog_viewed: ["catalogId"],
+  category_viewed: ["catalogId", "categoryId"],
+  item_viewed: ["catalogId", "itemId"],
+  search_performed: ["catalogId"],
+  filter_applied: ["catalogId"],
+  item_shared: ["catalogId", "itemId"],
+  item_favorited: ["catalogId", "itemId"],
+  language_changed: ["catalogId"],
+  branch_changed: ["catalogId"],
+  cta_clicked: ["catalogId"],
+} as const satisfies Record<
+  (typeof analyticsEventNames)[number],
+  readonly ("catalogId" | "categoryId" | "itemId" | "qrCodeId")[]
+>;
+
+export const ingestAnalyticsSchema = z
+  .object({
+    eventName: z.enum(analyticsEventNames),
+    businessId: z.uuid(),
+    catalogId: z.uuid().optional(),
+    categoryId: z.uuid().optional(),
+    itemId: z.uuid().optional(),
+    qrCodeId: z.uuid().optional(),
+    visitorId: z.string().min(1).max(100).optional(),
+    properties: z
+      .record(analyticsPropertyKeySchema, analyticsPropertyValueSchema)
+      .refine((properties) => Object.keys(properties).length <= 30, {
+        message: "Use at most 30 analytics properties",
+      })
+      .default({}),
+  })
+  .superRefine((event, context) => {
+    for (const field of requiredAnalyticsReferences[event.eventName]) {
+      if (!event[field])
+        context.addIssue({
+          code: "custom",
+          path: [field],
+          message: `${field} is required for ${event.eventName}`,
+        });
+    }
+  });
 
 const hexColorSchema = z
   .string()

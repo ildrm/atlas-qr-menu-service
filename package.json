@@ -4,20 +4,20 @@
   "private": true,
   "packageManager": "pnpm@10.28.2",
   "engines": {
-    "node": ">=22.0.0"
+    "node": ">=22.12.0"
   },
   "scripts": {
     "build": "turbo run build",
-    "dev": "turbo run dev --parallel",
+    "dev": "turbo run dev",
     "lint": "turbo run lint",
-    "typecheck": "pnpm --filter @atlas/contracts build && pnpm --filter @atlas/database build && turbo run typecheck",
+    "typecheck": "turbo run typecheck",
     "test": "turbo run test",
     "test:e2e": "pnpm --filter @atlas/web test:e2e",
     "format:check": "prettier --check .",
     "format": "prettier --write .",
     "db:generate": "pnpm --filter @atlas/database generate",
     "db:migrate": "pnpm --filter @atlas/database migrate",
-    "db:seed": "pnpm --filter @atlas/database seed",
+    "db:seed": "turbo run seed --filter=@atlas/database",
     "db:studio": "pnpm --filter @atlas/database studio"
   },
   "devDependencies": {

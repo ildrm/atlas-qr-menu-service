@@ -1,16 +1,27 @@
-import { Controller, Get, Injectable } from "@nestjs/common";
+import { Controller, Get, HttpStatus, Injectable, Res } from "@nestjs/common";
 import { Redis } from "ioredis";
+import type { FastifyReply } from "fastify";
 
 import { Public } from "./common.js";
 import { appConfig } from "./config.js";
 import { DatabaseService } from "./database.service.js";
+
+export type ReadinessChecks = Record<"database" | "redis", "up" | "down">;
+
+export function readinessStatus(
+  checks: ReadinessChecks,
+): "ready" | "not_ready" {
+  return checks.database === "up" && checks.redis === "up"
+    ? "ready"
+    : "not_ready";
+}
 
 @Injectable()
 export class HealthService {
   constructor(private readonly database: DatabaseService) {}
 
   async readiness() {
-    const checks: Record<string, "up" | "down"> = {
+    const checks: ReadinessChecks = {
       database: "down",
       redis: "down",
     };
@@ -35,7 +46,7 @@ export class HealthService {
     } finally {
       redis.disconnect();
     }
-    return { status: checks.database === "up" ? "ready" : "not_ready", checks };
+    return { status: readinessStatus(checks), checks };
   }
 }
 
@@ -51,7 +62,11 @@ export class HealthController {
 
   @Public()
   @Get("ready")
-  readiness() {
-    return this.health.readiness();
+  async readiness(@Res({ passthrough: true }) response: FastifyReply) {
+    const result = await this.health.readiness();
+    if (result.status !== "ready") {
+      response.status(HttpStatus.SERVICE_UNAVAILABLE);
+    }
+    return result;
   }
 }
